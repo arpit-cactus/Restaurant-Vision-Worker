@@ -5,13 +5,26 @@
 
 ---
 
-## 🚀 Quick Start
+## ⚡ 1-Click Setup & Start (Recommended)
 
-### 1. Requirements
-- Python 3.12+
-- OpenCV / ONNX Runtime (or GPU-accelerated TensorRT)
+Just run the setup script:
+```bash
+./setup.sh
+# or
+./start.sh
+```
 
-### 2. Setup
+This single command automatically:
+1. Detects Python 3
+2. Creates and activates an isolated virtual environment (`.venv`)
+3. Installs and verifies dependencies from `requirements.txt`
+4. Generates `.env` from `.env.example` if not present
+5. Runs the unit test suite
+6. Launches the worker engine
+
+---
+
+## 🛠 Manual Setup
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
