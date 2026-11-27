@@ -29,17 +29,20 @@ def point_in_polygon(x: float, y: float, polygon: list[list[float]]) -> bool:
     if n < 3:
         return False
     inside = False
-    p1x, p1y = polygon[0]
-    for i in range(1, n + 1):
-        p2x, p2y = polygon[i % n]
-        if y > min(p1y, p2y):
-            if y <= max(p1y, p2y):
-                if x <= max(p1x, p2x):
-                    if p1y != p2y:
-                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
-                    if p1x == p2x or x <= xinters:
-                        inside = not inside
-        p1x, p1y = p2x, p2y
+    try:
+        p1x, p1y = float(polygon[0][0]), float(polygon[0][1])
+        for i in range(1, n + 1):
+            p2x, p2y = float(polygon[i % n][0]), float(polygon[i % n][1])
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+    except (IndexError, TypeError, ValueError):
+        return False
     return inside
 
 
@@ -103,6 +106,13 @@ class CVWorkerEngine:
                     self.state_machines[t_id].seat_threshold_sec = self.seat_threshold_sec
                     self.state_machines[t_id].leave_threshold_sec = self.leave_threshold_sec
 
+        # Clean up state machines for tables that are no longer mapped
+        for old_t_id in list(self.state_machines.keys()):
+            if old_t_id not in seen_tables:
+                del self.state_machines[old_t_id]
+                self.simulated_occupants.pop(old_t_id, None)
+                self.simulated_cycle_end.pop(old_t_id, None)
+
         self.camera_regions = new_camera_regions
         logger.info(
             f"Config synced: restaurant={self.restaurant_id}, cameras={len(self.cameras)}, "
@@ -117,11 +127,12 @@ class CVWorkerEngine:
                 now_iso = datetime.now(timezone.utc).isoformat()
                 camera_health_list = [
                     {
-                        "camera_id": cam.get("camera_id"),
+                        "camera_id": str(cam.get("camera_id")),
                         "status": "online",
                         "last_frame_at": now_iso,
                     }
                     for cam in self.cameras
+                    if cam.get("camera_id")
                 ]
 
                 success = await self.client.send_heartbeat(
@@ -148,21 +159,30 @@ class CVWorkerEngine:
             await asyncio.sleep(settings.CONFIG_POLL_INTERVAL_SEC)
 
     async def queue_flush_loop(self) -> None:
-        """Continuously flushes buffered events from SQLite to backend."""
+        """Continuously flushes buffered events from SQLite to backend with dead-letter protection."""
         while self.running:
             try:
                 pending = self.queue.get_pending(limit=50)
                 if pending:
-                    success = await self.client.send_events(pending)
+                    success, is_fatal_client_error = await self.client.send_events(pending)
+                    event_ids = [e["event_id"] for e in pending]
+
                     if success:
-                        event_ids = [e["event_id"] for e in pending]
                         self.queue.remove(event_ids)
                         logger.info(f"Successfully flushed {len(pending)} events to backend")
-                    else:
-                        logger.warning(
-                            f"Failed to post {len(pending)} events; buffered in local SQLite"
+                    elif is_fatal_client_error:
+                        # 400 or 422: Poison-pill events rejected by schema or invalid table reference
+                        logger.error(
+                            f"Moving {len(event_ids)} permanently unprocessable events to dead-letter queue"
                         )
-                        await asyncio.sleep(2.0)
+                        self.queue.mark_failed(event_ids, "Backend 4xx client validation error")
+                    else:
+                        # 5xx or network disconnect: increment retries and backoff
+                        self.queue.increment_retries(event_ids)
+                        logger.warning(
+                            f"Network retry scheduled for {len(pending)} buffered events"
+                        )
+                        await asyncio.sleep(3.0)
                         continue
             except Exception as e:
                 logger.error(f"Error in queue flush loop: {e}")
@@ -215,7 +235,7 @@ class CVWorkerEngine:
 
                             person_count = self.simulated_occupants.get(table_id, 0)
                         else:
-                            # Direct point-in-polygon on RTSP frame detections
+                            # Direct RTSP detection fallback (if opencv available)
                             person_count = 0
 
                         # Update debounce state machine
@@ -238,12 +258,12 @@ class CVWorkerEngine:
         logger.info("Initializing TableSense CV Worker Engine...")
         self.running = True
 
-        # Initial config attempt
-        for attempt in range(1, 6):
-            logger.info(f"Connecting to backend ({settings.API_URL}) - attempt {attempt}/5...")
+        # Initial config attempt with backoff
+        for attempt in range(1, 11):
+            logger.info(f"Connecting to backend ({settings.API_URL}) - attempt {attempt}/10...")
             if await self.update_config():
                 break
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(min(5.0, 1.0 * attempt))
 
         logger.info(
             f"Worker started. Pending events in local queue: {self.queue.count()}. "
@@ -258,17 +278,18 @@ class CVWorkerEngine:
             self.detection_loop(),
         )
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         logger.info("Stopping CV Worker Engine...")
         self.running = False
         self.flush_trigger.set()
+        await self.client.close()
 
 
 async def main() -> None:
     engine = CVWorkerEngine()
 
     def handle_signal():
-        engine.stop()
+        asyncio.create_task(engine.stop())
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -282,7 +303,7 @@ async def main() -> None:
     except asyncio.CancelledError:
         pass
     finally:
-        engine.stop()
+        await engine.stop()
         logger.info("CV Worker shut down gracefully.")
 
 

@@ -20,8 +20,8 @@ class TableStateMachine:
     ):
         self.restaurant_id = str(restaurant_id)
         self.table_id = str(table_id)
-        self.seat_threshold_sec = seat_threshold_sec
-        self.leave_threshold_sec = leave_threshold_sec
+        self.seat_threshold_sec = max(1, seat_threshold_sec)
+        self.leave_threshold_sec = max(1, leave_threshold_sec)
 
         self.current_state = initial_state
         self.presence_started_at: datetime | None = None
@@ -35,8 +35,13 @@ class TableStateMachine:
         camera_id: str | None = None,
     ) -> dict[str, Any] | None:
         now = timestamp or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
 
-        if self.current_state in ("free", "unknown", "needs_cleaning"):
+        # Normalize camera_id
+        valid_camera_id = str(camera_id).strip() if camera_id and str(camera_id).strip() else None
+
+        if self.current_state in ("free", "unknown", "needs_cleaning", "reserved"):
             if person_count > 0:
                 self.max_party_size = max(self.max_party_size, person_count)
                 if self.presence_started_at is None:
@@ -54,11 +59,11 @@ class TableStateMachine:
                         "event_id": str(uuid.uuid4()),
                         "restaurant_id": self.restaurant_id,
                         "table_id": self.table_id,
-                        "camera_id": camera_id,
+                        "camera_id": valid_camera_id,
                         "occurred_at": now.isoformat(),
                         "from_state": old_state,
                         "to_state": "occupied",
-                        "person_count": self.max_party_size,
+                        "person_count": max(1, self.max_party_size),
                         "confidence": 0.95,
                     }
             else:
@@ -76,14 +81,13 @@ class TableStateMachine:
                     self.current_state = "free"
                     self.absence_started_at = None
                     self.presence_started_at = None
-                    last_party_size = self.max_party_size
                     self.max_party_size = 0
 
                     return {
                         "event_id": str(uuid.uuid4()),
                         "restaurant_id": self.restaurant_id,
                         "table_id": self.table_id,
-                        "camera_id": camera_id,
+                        "camera_id": valid_camera_id,
                         "occurred_at": now.isoformat(),
                         "from_state": "occupied",
                         "to_state": "free",

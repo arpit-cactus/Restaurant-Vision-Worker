@@ -25,6 +25,9 @@ htmlcov/
 *.sqlite3
 *.db
 
+# Tests
+tests/
+
 # OS / IDE
 .DS_Store
 .idea/
